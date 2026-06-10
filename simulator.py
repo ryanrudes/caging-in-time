@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from math import tau
+from math import tau, sin, cos
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -97,19 +97,34 @@ class SimParams:
     num_actions: int = 12
 
 
-@dataclass(frozen=True)
-class ObjectState:
-    x: float
-    y: float
+class PSS:
+    def __init__(self, params: SimParams, cage_center: tuple[float, float]):
+        self.H = params.grid_height
+        self.W = params.grid_width
+        self.resolution = params.resolution
+        self.cx = cage_center[0]
+        self.cy = cage_center[1]
 
+        self.pss = {}
 
-@dataclass(frozen=True)
-class Trajectory:
-    waypoints: list[ObjectState]
+    def add(self, x: float, y: float):
+        i = int(round((x - self.cx) / self.resolution + self.W / 2))
+        j = int(round((y - self.cy) / self.resolution + self.H / 2))
+        if 0 <= i < self.H and 0 <= j < self.W:
+            self.pss[(i, j)] = (x, y)
+
+    def is_occupied(self, x: float, y: float) -> bool:
+        i = int(round((x - self.cx) / self.resolution + self.W / 2))
+        j = int(round((y - self.cy) / self.resolution + self.H / 2))
+        return (i, j) in self.pss
+
+    def __iter__(self):
+        for x, y in self.pss.values():
+            yield x, y
 
 
 class Simulator:
-    def __init__(self, params: SimParams, trajectory: Trajectory):
+    def __init__(self, params: SimParams, trajectory: list[tuple[float, float]]):
         self.params = params
         self.trajectory = trajectory
 
@@ -126,26 +141,19 @@ class Simulator:
     
     def get_action_angle(self, k: int) -> float:
         return tau * k / self.K
-    
+
     def world_to_grid(self, x: float, y: float, cage_center: tuple[float, float]) -> tuple[int, int]:
-        x_cage, y_cage = cage_center
-        j = int(round((x - x_cage) / self.resolution + self.W / 2))
-        i = int(round((y - y_cage) / self.resolution + self.H / 2))
+        cage_cx, cage_cy = cage_center
+        j = int(round((x - cage_cx) / self.resolution + self.W / 2))
+        i = int(round((y - cage_cy) / self.resolution + self.H / 2))
         return i, j
-    
-    def reset(self):
+
+    def reset(self, x_object: float, y_object: float):
         self.t = 0
-        self.q = ObjectState(x=0, y=0)
 
-        self.Q = {self.q}
-        self.I = np.zeros((self.H, self.W), dtype=bool)
+        self.pss = PSS(self.params, (x_object, y_object))
+        self.pss.add(x_object, y_object)
 
-        c0 = self.trajectory.waypoints[0]
-
-        i, j = self.world_to_grid(c0.x, c0.y, (c0.x, c0.y))
-        if 0 <= i < self.H and 0 <= j < self.W:
-            self.I[i, j] = True
-    
     def propagate(self, u: float | None):
         """
         Propagate the PSS one step under the selected action.
@@ -153,26 +161,19 @@ class Simulator:
         Args:
             u: The action angle in radians.
         """
-        Q_next = set()
-        I_next = np.zeros((self.H, self.W), dtype=bool)
+        cage_center = self.trajectory[self.t]
 
-        x_traj = self.trajectory.waypoints[self.t + 1].x
-        y_traj = self.trajectory.waypoints[self.t + 1].y
+        pss_next = PSS(self.params, cage_center)
 
-        x_cage = x_traj
-        y_cage = y_traj
-        cage_center = (x_cage, y_cage)
-
-        for q in self.Q:
-            x_object = q.x
-            y_object = q.y
-
+        for x_object_maybe, y_object_maybe in self.pss:
             if u is None:
                 # No push action, so the object stays where it is.
-                V = [np.zeros(2)]
+                V = [(0, 0)]
             else:
-                dist = d_q_L(x_object, y_object, u, cage_center, self.R, self.L)
-            
+                # Get the distance from the potential object position to the pusher
+                dist = d_q_L(x_object_maybe, y_object_maybe, u, cage_center, self.R, self.L)
+
+                # Get the distance over which the object is pushed
                 if dist > self.r + self.d_push:
                     # no contact
                     d_con = 0
@@ -181,12 +182,12 @@ class Simulator:
                     d_con = self.d_push
                 else:
                     d_con = self.d_push - (dist - self.r)
-                
+
                 if d_con <= 0:
-                    V = [np.zeros(2)]
+                    V = [(0, 0)]
                 else:
                     V = discretized_V_pixel_offsets(u, d_con, self.resolution)
-            
+
             for v in V:
                 dx = v[0]
                 dy = v[1]
@@ -194,7 +195,7 @@ class Simulator:
                 x_next = x_object + dx
                 y_next = y_object + dy
 
-                Q_next.add(ObjectState(x=x_next, y=y_next))
+                Q_next.add((x_next, y_next))
 
                 # Get world to grid coordinates
                 i, j = self.world_to_grid(x_next, y_next, cage_center)
@@ -214,32 +215,47 @@ if __name__ == "__main__":
         pusher_length=0.30,
         push_distance=0.015,
         cage_size=0.10,
-        resolution=0.002,
-        grid_height=151,
-        grid_width=151,
+        resolution=0.006,
+        grid_height=51,
+        grid_width=51,
     )
 
     # Create a long trajectory of 100 waypoints
     waypoints = []
-    x = 0.0
-    y = 0.0
+    x = 0
+    y = 0
     for i in range(100):
         x += 0.01
-        y += 0.01
-        waypoints.append(ObjectState(x=x, y=y))
+        waypoints.append((x, y))
 
-    trajectory = Trajectory(waypoints=waypoints)
-
-    sim = Simulator(params, trajectory)
-    sim.reset()
+    sim = Simulator(params, waypoints)
+    sim.reset(0, 0)
 
     for _ in range(len(waypoints)):
-        k = np.random.randint(params.num_actions)
+        k = 6#np.random.randint(params.num_actions)
         theta = sim.get_action_angle(k)
 
         sim.propagate(theta)
 
-        I = sim.I.astype(np.uint8) * 255
+        image = sim.I.astype(np.uint8) * 255
 
-        plt.imshow(I, cmap='gray')
+        cage_center = sim.trajectory[sim.t]
+
+        pusher_x = cage_center[0] + sim.R * cos(theta)
+        pusher_y = cage_center[1] + sim.R * sin(theta)
+
+        p1_x = pusher_x - sim.L / 2 * sin(theta)
+        p1_y = pusher_y + sim.L / 2 * cos(theta)
+
+        p2_x = pusher_x + sim.L / 2 * sin(theta)
+        p2_y = pusher_y - sim.L / 2 * cos(theta)
+
+        # Convert to grid coordinates
+        p1_i, p1_j = sim.world_to_grid(p1_x, p1_y, sim.trajectory[sim.t])
+        p2_i, p2_j = sim.world_to_grid(p2_x, p2_y, sim.trajectory[sim.t])
+
+        plt.imshow(image, cmap='gray')
+        plt.plot([p1_j, p2_j], [p1_i, p2_i], color="red", linewidth=3, label="Active Pusher")
+        plt.xlim(0, sim.W)
+        plt.ylim(0, sim.H)
         plt.show()
