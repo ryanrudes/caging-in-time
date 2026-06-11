@@ -1,13 +1,11 @@
 from dataclasses import dataclass
-from math import tau, sin, cos
+from math import tau, sin, cos, tau, pi
+from typing import Iterator
 
 import matplotlib.pyplot as plt
 import numpy as np
+import cv2
 
-# from pss import GridPSS
-
-
-import numpy as np
 
 def d_q_L(x, y, u, cage_center, cage_radius, pusher_length):
     """
@@ -51,8 +49,6 @@ def d_q_L(x, y, u, cage_center, cage_radius, pusher_length):
 
 
 def discretized_V_pixel_offsets(u, d_con, resolution):
-    if d_con <= 0.0:
-        return [np.array([0.0, 0.0])]
     nx = int(np.ceil(d_con / resolution))
     ny = int(np.ceil((0.5 * d_con) / resolution))
     c = np.cos(u)
@@ -102,21 +98,36 @@ class PSS:
         self.H = params.grid_height
         self.W = params.grid_width
         self.resolution = params.resolution
+        self.cage_radius = params.cage_size
         self.cx = cage_center[0]
         self.cy = cage_center[1]
 
         self.pss = {}
+        self.out_of_bounds = False
+    
+    def __len__(self):
+        return len(self.pss)
 
     def add(self, x: float, y: float):
-        i = int(round((x - self.cx) / self.resolution + self.W / 2))
-        j = int(round((y - self.cy) / self.resolution + self.H / 2))
+        dy = y - self.cy
+        dx = x - self.cx
+        i = int(round((dy / self.resolution + self.H / 2)))
+        j = int(round((dx / self.resolution + self.W / 2)))
         if 0 <= i < self.H and 0 <= j < self.W:
             self.pss[(i, j)] = (x, y)
+        
+        # Check if the point is out of bounds
+        if dx * dx + dy * dy > self.cage_radius * self.cage_radius:
+            self.out_of_bounds = True
 
     def is_occupied(self, x: float, y: float) -> bool:
-        i = int(round((x - self.cx) / self.resolution + self.W / 2))
-        j = int(round((y - self.cy) / self.resolution + self.H / 2))
+        i = int(round((y - self.cy) / self.resolution + self.H / 2))
+        j = int(round((x - self.cx) / self.resolution + self.W / 2))
         return (i, j) in self.pss
+    
+    def grid_cells(self) -> Iterator[tuple[int, int]]:
+        for i, j in self.pss.keys():
+            yield i, j
 
     def __iter__(self):
         for x, y in self.pss.values():
@@ -138,6 +149,7 @@ class Simulator:
 
         self.d_push = params.push_distance
         self.resolution = params.resolution
+        self.cage_radius = params.cage_size
     
     def get_action_angle(self, k: int) -> float:
         return tau * k / self.K
@@ -150,17 +162,17 @@ class Simulator:
 
     def reset(self, x_object: float, y_object: float):
         self.t = 0
-
-        self.pss = PSS(self.params, (x_object, y_object))
+        self.pss = PSS(self.params, self.trajectory[0])
         self.pss.add(x_object, y_object)
 
-    def propagate(self, u: float | None):
+    def propagate(self, u: float | None, render: bool = False) -> np.ndarray | None:
         """
         Propagate the PSS one step under the selected action.
 
         Args:
             u: The action angle in radians.
         """
+        self.t += 1
         cage_center = self.trajectory[self.t]
 
         pss_next = PSS(self.params, cage_center)
@@ -168,94 +180,164 @@ class Simulator:
         for x_object_maybe, y_object_maybe in self.pss:
             if u is None:
                 # No push action, so the object stays where it is.
-                V = [(0, 0)]
-            else:
-                # Get the distance from the potential object position to the pusher
-                dist = d_q_L(x_object_maybe, y_object_maybe, u, cage_center, self.R, self.L)
+                pss_next.add(x_object_maybe, y_object_maybe)
+                continue
 
-                # Get the distance over which the object is pushed
-                if dist > self.r + self.d_push:
-                    # no contact
-                    d_con = 0
-                elif dist <= self.r:
-                    # already touching / intersecting
-                    d_con = self.d_push
-                else:
-                    d_con = self.d_push - (dist - self.r)
+            # Get the distance from the potential object position to the pusher
+            dist = d_q_L(x_object_maybe, y_object_maybe, u, cage_center, self.R, self.L)
 
-                if d_con <= 0:
-                    V = [(0, 0)]
-                else:
-                    V = discretized_V_pixel_offsets(u, d_con, self.resolution)
+            # Get the distance over which the object is pushed
+            d_con = max(0, min(self.d_push, self.r + self.d_push - dist))
 
-            for v in V:
-                dx = v[0]
-                dy = v[1]
+            if d_con <= 0:
+                pss_next.add(x_object_maybe, y_object_maybe)
+                continue
+            
+            V = discretized_V_pixel_offsets(u, d_con, self.resolution)
 
-                x_next = x_object + dx
-                y_next = y_object + dy
+            for dx, dy in V:
+                x_next = x_object_maybe + dx
+                y_next = y_object_maybe + dy
 
-                Q_next.add((x_next, y_next))
+                pss_next.add(x_next, y_next)
 
-                # Get world to grid coordinates
-                i, j = self.world_to_grid(x_next, y_next, cage_center)
+        self.pss = pss_next
 
-                if 0 <= i < self.H and 0 <= j < self.W:
-                    I_next[i, j] = True
+        if render:
+            return self.render()
+    
+    def find_push(self):
+        next_cage_center = self.trajectory[self.t + 1]
+        cx, cy = next_cage_center
 
-        self.Q = Q_next
-        self.I = I_next
+        # If the PSS is contained within the next cage, do nothing
+        is_contained = True
+        for x, y in self.pss:
+            dx = x - cx
+            dy = y - cy
+            if dx * dx + dy * dy > self.cage_radius * self.cage_radius:
+                is_contained = False
+                break
 
-        self.t += 1
+        if is_contained:
+            return None
+        
+        for k in range(self.K):
+            # Compute the furthest distance from behind the line pusher
+            # to the POA boundary
+            # TODO: Implement this
+        return None
+    
+    @property
+    def I(self) -> np.ndarray:
+        I = np.zeros((self.H, self.W), dtype=float)
+        for i, j in self.pss.grid_cells():
+            I[i, j] = 1.0
+        return I
+    
+    def render(self) -> np.ndarray:
+        image = np.zeros((self.H, self.W, 3), dtype=np.uint8)
+
+        cage_center = self.trajectory[sim.t]
+        xc, yc = cage_center
+
+        pusher_x = xc + self.R * cos(theta)
+        pusher_y = yc + self.R * sin(theta)
+
+        p1_x = pusher_x - self.L / 2 * sin(theta)
+        p1_y = pusher_y + self.L / 2 * cos(theta)
+
+        p2_x = pusher_x + self.L / 2 * sin(theta)
+        p2_y = pusher_y - self.L / 2 * cos(theta)
+
+        # Convert to grid coordinates
+        p1_i, p1_j = self.world_to_grid(p1_x, p1_y, cage_center)
+        p2_i, p2_j = self.world_to_grid(p2_x, p2_y, cage_center)
+
+        # Draw cv2 line on image
+        cv2.line(image, (p1_j, p1_i), (p2_j, p2_i), (255, 0, 0), 1)
+
+        # plt.imshow(image, cmap='gray')
+        # plt.plot([p1_j, p2_j], [p1_i, p2_i], color="red", linewidth=3, label="Active Pusher")
+
+        # Draw the cage boundary (outer circle)
+        ic, jc = self.world_to_grid(xc, yc, cage_center)
+        cv2.circle(image, (jc, ic), int(self.R / self.resolution), (96, 169, 101), 1)
+
+        # Draw the trajectory
+        for x, y in self.trajectory:
+            i, j = self.world_to_grid(x, y, cage_center)
+            if 0 <= i < self.H and 0 <= j < self.W:
+                image[i, j] = (0, 0, 255)
+        
+        # Draw the POA
+        for i, j in self.pss.grid_cells():
+            # Draw a circle at the POA
+            # First, convert the object radius to grid units
+            radius_grid = int(self.params.object_radius / self.resolution)
+            cv2.circle(image, (j, i), radius_grid, (96, 169, 101), 1)
+        
+        # Draw the PSS
+        for i, j in self.pss.grid_cells():
+            image[i, j] = (255, 255, 255)
+
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = cv2.resize(image, (0, 0), fx=3, fy=3)
+        return image
+
+
+def create_circular_trajectory(radius: float, speed: float) -> list[tuple[float, float]]:
+    circle_path_length = tau * radius
+    num_waypoints = int(circle_path_length / speed)
+    waypoints = []
+    for i in range(num_waypoints):
+        t = tau * i / num_waypoints
+        x = radius * cos(t)
+        y = radius * sin(t)
+        waypoints.append((x, y))
+    return waypoints
 
 
 if __name__ == "__main__":
     params = SimParams(
         object_radius=0.025,
-        pusher_length=0.30,
-        push_distance=0.015,
-        cage_size=0.10,
-        resolution=0.006,
-        grid_height=51,
-        grid_width=51,
+        pusher_length=0.1,
+        push_distance=0.025,
+        cage_size=0.05,
+        resolution=0.002,
+        grid_height=151,
+        grid_width=151,
     )
 
     # Create a long trajectory of 100 waypoints
-    waypoints = []
-    x = 0
-    y = 0
-    for i in range(100):
-        x += 0.01
-        waypoints.append((x, y))
+    waypoints = create_circular_trajectory(radius=1, speed=0.001)
+
+    x0, y0 = waypoints[0]
 
     sim = Simulator(params, waypoints)
-    sim.reset(0, 0)
+    sim.reset(x0, y0)
 
-    for _ in range(len(waypoints)):
-        k = 6#np.random.randint(params.num_actions)
+    for i in range(len(waypoints) - 1):
+        # k = 9#np.random.randint(params.num_actions)
+        if i < 30:
+            k = 9
+        else:
+            k = 0
+
         theta = sim.get_action_angle(k)
+        image = sim.propagate(theta, render=True)
+        
+        cv2.imshow('image', image)
+        cv2.waitKey(1)
 
-        sim.propagate(theta)
+        if sim.pss.out_of_bounds:
+            print(f"Object is out of bounds at step {i}")
+            break
 
-        image = sim.I.astype(np.uint8) * 255
+        
 
-        cage_center = sim.trajectory[sim.t]
-
-        pusher_x = cage_center[0] + sim.R * cos(theta)
-        pusher_y = cage_center[1] + sim.R * sin(theta)
-
-        p1_x = pusher_x - sim.L / 2 * sin(theta)
-        p1_y = pusher_y + sim.L / 2 * cos(theta)
-
-        p2_x = pusher_x + sim.L / 2 * sin(theta)
-        p2_y = pusher_y - sim.L / 2 * cos(theta)
-
-        # Convert to grid coordinates
-        p1_i, p1_j = sim.world_to_grid(p1_x, p1_y, sim.trajectory[sim.t])
-        p2_i, p2_j = sim.world_to_grid(p2_x, p2_y, sim.trajectory[sim.t])
-
-        plt.imshow(image, cmap='gray')
-        plt.plot([p1_j, p2_j], [p1_i, p2_i], color="red", linewidth=3, label="Active Pusher")
-        plt.xlim(0, sim.W)
-        plt.ylim(0, sim.H)
-        plt.show()
+        # plt.imshow(image, cmap='gray')
+        # plt.plot([p1_j, p2_j], [p1_i, p2_i], color="red", linewidth=3, label="Active Pusher")
+        # plt.xlim(0, sim.W)
+        # plt.ylim(0, sim.H)
+        # plt.show()
