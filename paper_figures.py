@@ -187,6 +187,7 @@ def cmd_rollout_quasistatic(args: argparse.Namespace) -> None:
         cage_size=args.cage_size,
         trajectory_shape=args.trajectory_shape,
         trajectory_radius=args.trajectory_radius,
+        ice_mode=args.ice_mode,
     )
     env = PolygonCagingEnv(params=params)
     policy_fn = make_quasistatic_policy(args.policy, args.model_path)
@@ -223,6 +224,7 @@ def fig15_env_params(
     K: int,
     trajectory_radius: float,
     trajectory_speed: float,
+    ice_mode: bool = False,
 ) -> CagingEnvParams:
     """
     Env params for one Fig. 15 condition. The default 121-cell belief grid
@@ -242,6 +244,7 @@ def fig15_env_params(
         trajectory_speed=trajectory_speed,
         grid_height=cells,
         grid_width=cells,
+        ice_mode=ice_mode,
     )
 
 
@@ -252,9 +255,10 @@ def run_fig15_trial(
     trajectory_speed: float,
     seed: int,
     polygon_vertices_body: np.ndarray,
+    ice_mode: bool = False,
 ) -> tuple[int, np.ndarray, np.ndarray, float, bool]:
     """Run one Fig. 15 trial in a worker process."""
-    params = fig15_env_params(cage_mm, K, trajectory_radius, trajectory_speed)
+    params = fig15_env_params(cage_mm, K, trajectory_radius, trajectory_speed, ice_mode)
     env = PolygonCagingEnv(
         params=params,
         polygon_vertices_body=polygon_vertices_body,
@@ -313,7 +317,9 @@ def cmd_fig15(args: argparse.Namespace) -> None:
     jobs = []
     for i, cage_mm in enumerate(cage_sizes_mm):
         for j, K in enumerate(action_counts):
-            params = fig15_env_params(cage_mm, K, args.trajectory_radius, args.trajectory_speed)
+            params = fig15_env_params(
+                cage_mm, K, args.trajectory_radius, args.trajectory_speed, args.ice_mode
+            )
             reference_env = PolygonCagingEnv(params=params)
             all_references[(i, j)] = np.asarray(reference_env.trajectory, dtype=float)
             for seed in range(num_plot_trajectories):
@@ -334,6 +340,7 @@ def cmd_fig15(args: argparse.Namespace) -> None:
                 args.trajectory_speed,
                 seed,
                 polygon_vertices_body,
+                args.ice_mode,
             )
             trial_results[(i, j)].append((seed_out, centers, point_path, mae, success))
     else:
@@ -348,6 +355,7 @@ def cmd_fig15(args: argparse.Namespace) -> None:
                     args.trajectory_speed,
                     seed,
                     polygon_vertices_body,
+                    args.ice_mode,
                 ): (i, j)
                 for i, j, cage_mm, K, seed, polygon_vertices_body in jobs
             }
@@ -612,6 +620,7 @@ def cmd_fig17(args: argparse.Namespace) -> None:
         trajectory_shape="figure8",
         trajectory_radius=args.trajectory_radius,
         trajectory_loops=args.loops,
+        ice_mode=args.ice_mode,
     )
 
     env = PolygonCagingEnv(params=params)
@@ -711,7 +720,7 @@ def cmd_fig19(args: argparse.Namespace) -> None:
     # and 1 s lags correspond to a few action steps.
     lag_settings = [(), (5,), (10,)]
 
-    params = CagingEnvParams(num_actions=args.num_actions)
+    params = CagingEnvParams(num_actions=args.num_actions, ice_mode=args.ice_mode)
     reference = np.asarray(PolygonCagingEnv(params=params).trajectory, dtype=float)
 
     heuristic_maes = []
@@ -967,6 +976,7 @@ def cmd_rollout_dynamic(args: argparse.Namespace) -> None:
         dimensionality=2,
         trajectory=args.trajectory,
         max_episode_steps=args.max_steps,
+        ice_mode=args.ice_mode,
     )
     env = DynamicPlateTilt(config)
     policy_fn = make_dynamic_policy(args.policy, args.model_path, env)
@@ -1039,6 +1049,7 @@ def cmd_fig21(args: argparse.Namespace) -> None:
         dimensionality=2,
         trajectory=args.trajectory,
         max_episode_steps=args.max_steps,
+        ice_mode=args.ice_mode,
     )
 
     success = np.zeros((len(velocity_stds), len(tilt_rate_limits)))
@@ -1097,6 +1108,11 @@ def parse_args() -> argparse.Namespace:
         p.add_argument("--dpi", type=int, default=600)
         p.add_argument("--styles", default="science,no-latex")
         p.add_argument("--seed", type=int, default=0)
+        p.add_argument(
+            "--ice-mode",
+            action="store_true",
+            help="Object geometry shrinks uncertainly over time (melting ice).",
+        )
 
     p = sub.add_parser("rollout-quasistatic")
     add_common(p)

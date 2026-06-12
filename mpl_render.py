@@ -167,7 +167,8 @@ def _pss_poa_rgba(
 
     n = int(np.ceil(2 * extent / resolution)) + 1
     occupancy = np.zeros((n, n), dtype=np.uint8)
-    for x, y in pss:
+    for point in pss:
+        x, y = point[:2]
         j = int(round((x - cx) / resolution + n / 2))
         i = int(round((y - cy) / resolution + n / 2))
         if 0 <= i < n and 0 <= j < n:

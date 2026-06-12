@@ -188,6 +188,7 @@ def make_config(args: argparse.Namespace) -> DynamicPlateTiltConfig:
         render_pss=args.render_pss,
         include_pss_particles_in_obs=not args.no_pss_particles,
         trajectory_preview_step_offsets=tuple(args.trajectory_preview_offsets),
+        ice_mode=args.ice_mode,
     )
 
 
@@ -475,6 +476,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-trajectory-mode", choices=["fixed", "random"], default="fixed")
     parser.add_argument("--trajectory", choices=["static", "line", "circle", "figure8"], default="line")
     parser.add_argument("--boundary-energy-method", choices=["corners", "edges"], default="corners")
+    parser.add_argument(
+        "--ice-mode",
+        action="store_true",
+        help="Object geometry shrinks uncertainly over time (melting ice).",
+    )
 
     parser.add_argument("--plate-size", type=float, default=0.16)
     parser.add_argument("--virtual-elastic-stiffness", type=float, default=1.0)

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import cached_property
 from math import pi
 from typing import Any, Literal
 
@@ -158,6 +157,9 @@ class DynamicPlateTilt(gym.Env):
         options = options or {}
 
         self.t = 0
+        # Ice mode melts r_b during the episode; restore it so episodes are
+        # independent.
+        self.r_b = self.config.object_radius
         self.x = np.asarray(
             options.get(
                 "x0",
@@ -181,9 +183,12 @@ class DynamicPlateTilt(gym.Env):
 
         return self._get_obs(), self._get_info()
 
-    @cached_property
+    @property
     def m_eff(self) -> float:
-        """The effective rolling mass of the object in the plate frame."""
+        """
+        The effective rolling mass of the object in the plate frame. Computed
+        on demand (not cached) because ice mode shrinks r_b over time.
+        """
         return self.m + self.I_b / (self.r_b * self.r_b)
 
     @property

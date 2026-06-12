@@ -73,6 +73,7 @@ def make_env(
     random_max_velocity: float,
     random_max_acceleration: float,
     render_mode: str | None = None,
+    ice_mode: bool = False,
 ) -> Callable[[], gym.Env]:
     def _init() -> gym.Env:
         # Limited information, as in a real deployment: the agent sees only the
@@ -80,6 +81,7 @@ def make_env(
         params = CagingEnvParams(
             include_noop_action=True,
             include_polygon_state_in_obs=False,
+            ice_mode=ice_mode,
         )
         env = RandomTrajectoryPolygonCagingEnv(
             params=params,
@@ -201,7 +203,7 @@ def train(args: argparse.Namespace) -> None:
     if not args.no_check:
         check_env(
             RandomTrajectoryPolygonCagingEnv(
-                params=CagingEnvParams(),
+                params=CagingEnvParams(ice_mode=args.ice_mode),
                 random_trajectory=args.trajectory_mode == "random",
                 trajectory_seed=args.seed,
                 max_position=args.random_max_position,
@@ -222,6 +224,7 @@ def train(args: argparse.Namespace) -> None:
                 random_max_position=args.random_max_position,
                 random_max_velocity=args.random_max_velocity,
                 random_max_acceleration=args.random_max_acceleration,
+                ice_mode=args.ice_mode,
             )
             for i in range(args.num_envs)
         ]
@@ -237,6 +240,7 @@ def train(args: argparse.Namespace) -> None:
                 random_max_position=args.random_max_position,
                 random_max_velocity=args.random_max_velocity,
                 random_max_acceleration=args.random_max_acceleration,
+                ice_mode=args.ice_mode,
             )
         ]
     )
@@ -269,6 +273,7 @@ def train(args: argparse.Namespace) -> None:
             random_max_velocity=args.random_max_velocity,
             random_max_acceleration=args.random_max_acceleration,
             render_mode="rgb_array",
+            ice_mode=args.ice_mode,
         ),
         log_dir=log_dir,
         run_dir=run_dir,
@@ -321,6 +326,7 @@ def enjoy(args: argparse.Namespace) -> None:
     params = CagingEnvParams(
         include_noop_action=True,
         include_polygon_state_in_obs=False,
+        ice_mode=args.ice_mode,
     )
     env = RandomTrajectoryPolygonCagingEnv(
         params=params,
@@ -354,6 +360,7 @@ def heuristic_rollout(args: argparse.Namespace) -> None:
     params = CagingEnvParams(
         include_noop_action=True,
         include_polygon_state_in_obs=False,
+        ice_mode=args.ice_mode,
     )
     env = RandomTrajectoryPolygonCagingEnv(
         params=params,
@@ -392,6 +399,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", type=str, default="models/ppo_caging/best_model.zip")
     parser.add_argument("--no-check", action="store_true")
     parser.add_argument("--stochastic", action="store_true")
+    parser.add_argument(
+        "--ice-mode",
+        action="store_true",
+        help="Object geometry shrinks uncertainly over time (melting ice).",
+    )
 
     parser.add_argument("--trajectory-mode", choices=["fixed", "random"], default="fixed")
     parser.add_argument("--eval-trajectory-mode", choices=["fixed", "random"], default="fixed")

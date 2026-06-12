@@ -94,6 +94,12 @@ class SimParams:
     lambda_1: float = 100
     lambda_2: float = 1
 
+    # Ice mode: the object's radius shrinks by an unknown factor in
+    # [1 - ice_melt_rate, 1] every step. The belief tracks the radius as an
+    # interval and propagates the union over its endpoints.
+    ice_mode: bool = False
+    ice_melt_rate: float = 0.013
+
 
 class PSS:
     def __init__(self, params: SimParams, cage_center: tuple[float, float]):
@@ -190,6 +196,11 @@ class Simulator:
         self.t = 0
         self.last_action_angle = None
         self.caged = True
+        # Radius belief interval [r_low, r]: in ice mode the lower bound
+        # shrinks every step while the upper bound stays at the initial
+        # radius (no melt is the worst case for displacement reach).
+        self.r = self.params.object_radius
+        self.r_low = self.r
         #self.pss = PSS(self.params, self.trajectory[0])
         #self.pss.add(x_object, y_object)
 
@@ -208,6 +219,11 @@ class Simulator:
         if u is not None:
             self.last_action_angle = u
         cage_center = self.trajectory[self.t]
+
+        if self.params.ice_mode:
+            # Worst-case lower bound of the radius interval after one more
+            # step of uncertain melting.
+            self.r_low *= 1.0 - self.params.ice_melt_rate
 
         # start = time()
         if u is None:
@@ -230,13 +246,6 @@ class Simulator:
                 closest = a + s[:, np.newaxis] * ab
                 distances = np.linalg.norm(self.pss - closest, axis=1)
             
-            # Get the distances over which the object is pushed
-            d_cons = np.clip(self.r + self.d_push - distances, 0, self.d_push)
-
-            # Select the indices where d_con is positive
-            d_cons_positive = d_cons > 0
-            d_cons_negative = d_cons <= 0
-
             occupied_grid = np.zeros(self.H * self.W, dtype=bool)
             pss_next_batches = []
 
@@ -297,65 +306,23 @@ class Simulator:
                 occupied_grid[local_flat] = True
                 pss_next_batches.append(points_in_bounds[local_unique_indices])
 
-            append_first_unoccupied(self.pss[d_cons_negative])
+            # In ice mode the radius is only known to lie in [r_low, r], and
+            # the propagated set must cover every hypothesis. Propagating the
+            # interval endpoints and taking the union over-approximates the
+            # union over the whole interval up to the grid resolution
+            # (d_con varies continuously with r between the endpoints).
+            radius_hypotheses = (
+                (self.r, self.r_low) if self.params.ice_mode else (self.r,)
+            )
 
-            # For contacted states, add the discretized quasi-static motion set
-            # V(u, d_con). Batch states with the same discretized ellipse size so
-            # each offset set is generated once, then use broadcasting to expand
-            # chunks of each batch. Deduplicate immediately to avoid materializing
-            # millions of candidates that collapse onto the same grid cells.
-            contacted_points = self.pss[d_cons_positive]
-            contacted_d_cons = d_cons[d_cons_positive]
-
-            if len(contacted_points) > 0:
-                nxs = np.ceil(contacted_d_cons / self.resolution).astype(int)
-                nys = np.ceil((0.5 * contacted_d_cons) / self.resolution).astype(int)
-                ellipse_bins = np.column_stack((nxs, nys))
-                unique_bins, inverse_bins = np.unique(ellipse_bins, axis=0, return_inverse=True)
-
-                c_u = np.cos(u)
-                s_u = np.sin(u)
-                R_u = np.array([[c_u, -s_u], [s_u, c_u]])
-                max_candidates_per_chunk = 2_000_000
-
-                for bin_idx, (nx, ny) in enumerate(unique_bins):
-                    batch_points = contacted_points[inverse_bins == bin_idx]
-                    d_con = float(contacted_d_cons[inverse_bins == bin_idx].max())
-
-                    ix = np.arange(-nx, 1, dtype=float)
-                    iy = np.arange(-ny, ny + 1, dtype=float)
-                    dx, dy = np.meshgrid(ix * self.resolution, iy * self.resolution, indexing="ij")
-
-                    ellipse_values = (dx / d_con) ** 2 + (dy / (0.5 * d_con)) ** 2
-                    valid = ellipse_values <= 1.0 + 1e-12
-                    local_offsets = np.column_stack((dx[valid], dy[valid]))
-
-                    if not np.any(np.all(np.isclose(local_offsets, 0.0), axis=1)):
-                        local_offsets = np.vstack((local_offsets, np.array([[0.0, 0.0]])))
-
-                    offsets = local_offsets @ R_u.T
-                    chunk_size = max(1, max_candidates_per_chunk // len(offsets))
-                    for start_idx in range(0, len(batch_points), chunk_size):
-                        chunk_points = batch_points[start_idx : start_idx + chunk_size]
-                        moved_points = (
-                            chunk_points[:, np.newaxis, :] + offsets[np.newaxis, :, :]
-                        ).reshape(-1, 2)
-
-                        # Exclude propagated states whose bounding circle would
-                        # intersect the pusher's final pose (Eq. 1: such states
-                        # are not in the object's free space). Each state keeps
-                        # the motions that resolve the contact as far as its
-                        # own motion set allows (best effort when d_con cannot
-                        # fully clear the overlap), with one grid cell of
-                        # slack for the discretized motion offsets.
-                        dist_final = distance_to_final_pusher(moved_points).reshape(
-                            len(chunk_points), len(offsets)
-                        )
-                        per_state_target = np.minimum(self.r, dist_final.max(axis=1))
-                        keep = dist_final >= (
-                            per_state_target[:, np.newaxis] - self.resolution - 1e-9
-                        )
-                        append_first_unoccupied(moved_points[keep.reshape(-1)])
+            for r_hyp in radius_hypotheses:
+                self._propagate_radius_hypothesis(
+                    r_hyp,
+                    u,
+                    distances,
+                    distance_to_final_pusher,
+                    append_first_unoccupied,
+                )
 
             if pss_next_batches:
                 pss_next = np.vstack(pss_next_batches)
@@ -364,6 +331,90 @@ class Simulator:
 
         self.pss = pss_next
 
+        return self._finish_propagate(cage_center, u, render)
+
+    def _propagate_radius_hypothesis(
+        self,
+        r_hyp: float,
+        u: float,
+        distances: np.ndarray,
+        distance_to_final_pusher,
+        append_first_unoccupied,
+    ) -> None:
+        """Propagate the PSS under one bounding-circle radius hypothesis."""
+        # Get the distances over which the object is pushed
+        d_cons = np.clip(r_hyp + self.d_push - distances, 0, self.d_push)
+
+        # Select the indices where d_con is positive
+        d_cons_positive = d_cons > 0
+        d_cons_negative = d_cons <= 0
+
+        append_first_unoccupied(self.pss[d_cons_negative])
+
+        # For contacted states, add the discretized quasi-static motion set
+        # V(u, d_con). Batch states with the same discretized ellipse size so
+        # each offset set is generated once, then use broadcasting to expand
+        # chunks of each batch. Deduplicate immediately to avoid materializing
+        # millions of candidates that collapse onto the same grid cells.
+        contacted_points = self.pss[d_cons_positive]
+        contacted_d_cons = d_cons[d_cons_positive]
+
+        if len(contacted_points) > 0:
+            nxs = np.ceil(contacted_d_cons / self.resolution).astype(int)
+            nys = np.ceil((0.5 * contacted_d_cons) / self.resolution).astype(int)
+            ellipse_bins = np.column_stack((nxs, nys))
+            unique_bins, inverse_bins = np.unique(ellipse_bins, axis=0, return_inverse=True)
+
+            c_u = np.cos(u)
+            s_u = np.sin(u)
+            R_u = np.array([[c_u, -s_u], [s_u, c_u]])
+            max_candidates_per_chunk = 2_000_000
+
+            for bin_idx, (nx, ny) in enumerate(unique_bins):
+                batch_points = contacted_points[inverse_bins == bin_idx]
+                d_con = float(contacted_d_cons[inverse_bins == bin_idx].max())
+
+                ix = np.arange(-nx, 1, dtype=float)
+                iy = np.arange(-ny, ny + 1, dtype=float)
+                dx, dy = np.meshgrid(ix * self.resolution, iy * self.resolution, indexing="ij")
+
+                ellipse_values = (dx / d_con) ** 2 + (dy / (0.5 * d_con)) ** 2
+                valid = ellipse_values <= 1.0 + 1e-12
+                local_offsets = np.column_stack((dx[valid], dy[valid]))
+
+                if not np.any(np.all(np.isclose(local_offsets, 0.0), axis=1)):
+                    local_offsets = np.vstack((local_offsets, np.array([[0.0, 0.0]])))
+
+                offsets = local_offsets @ R_u.T
+                chunk_size = max(1, max_candidates_per_chunk // len(offsets))
+                for start_idx in range(0, len(batch_points), chunk_size):
+                    chunk_points = batch_points[start_idx : start_idx + chunk_size]
+                    moved_points = (
+                        chunk_points[:, np.newaxis, :] + offsets[np.newaxis, :, :]
+                    ).reshape(-1, 2)
+
+                    # Exclude propagated states whose bounding circle would
+                    # intersect the pusher's final pose (Eq. 1: such states
+                    # are not in the object's free space). Each state keeps
+                    # the motions that resolve the contact as far as its
+                    # own motion set allows (best effort when d_con cannot
+                    # fully clear the overlap), with one grid cell of
+                    # slack for the discretized motion offsets.
+                    dist_final = distance_to_final_pusher(moved_points).reshape(
+                        len(chunk_points), len(offsets)
+                    )
+                    per_state_target = np.minimum(r_hyp, dist_final.max(axis=1))
+                    keep = dist_final >= (
+                        per_state_target[:, np.newaxis] - self.resolution - 1e-9
+                    )
+                    append_first_unoccupied(moved_points[keep.reshape(-1)])
+
+    def _finish_propagate(
+        self,
+        cage_center: tuple[float, float],
+        u: float | None,
+        render: bool,
+    ) -> np.ndarray | None:
         # Alg. 2 (lines 9-10): verify Q_{t+1} is contained in S_cage^{t+1}.
         # Two grid cells of tolerance account for the pixel-level
         # discretization: one from quantizing the motion set offsets and one
@@ -375,6 +426,7 @@ class Simulator:
         if render:
             image = self.render(u)
             return image
+        return None
 
     def potential_object_area_points(
         self, pss: PSS, cage_center: tuple[float, float]
@@ -686,6 +738,11 @@ if __name__ == "__main__":
         default=None,
         help="Save the matplotlib figure to this path instead of showing it",
     )
+    parser.add_argument(
+        "--ice-mode",
+        action="store_true",
+        help="Object geometry shrinks uncertainly over time (melting ice).",
+    )
     args = parser.parse_args()
 
     cage_size = 0.02 # R - r = 20 mm
@@ -702,6 +759,7 @@ if __name__ == "__main__":
         grid_height=1601,
         grid_width=1601,
         num_actions=128,
+        ice_mode=args.ice_mode,
     )
 
     # Create a long trajectory of 100 waypoints

@@ -250,11 +250,11 @@ class CagingEnvParams:
     grid_width: int = 121
     # K candidate pusher angles. The paper evaluates K in {16, 32, 64, 128};
     # below 16 the angular spacing is too coarse for reliable caging.
-    num_actions: int = 32
+    num_actions: int = 128
     num_polygon_vertices: int = 7
 
     ice_mode: bool = False
-    ice_melt_rate: float = 0.001
+    ice_melt_rate: float = 0.013
 
     lambda_1: float = 1.0
     lambda_2: float = 1.0
@@ -355,13 +355,15 @@ class PolygonCagingEnv(gym.Env):
             (-np.sin(self._action_angles), np.cos(self._action_angles))
         )
 
-        self._poa_radius_cells = int(np.ceil(self.r / self.resolution))
-        offsets = np.arange(-self._poa_radius_cells, self._poa_radius_cells + 1)
-        dj, di = np.meshgrid(offsets, offsets, indexing="xy")
-        self._poa_kernel = (
-            (dj * self.resolution) ** 2 + (di * self.resolution) ** 2
-            <= self.r * self.r + 1e-12
-        ).astype(np.uint8)
+        # PSS particles carry a radius hypothesis (ice mode melts it). Radii
+        # are deduplicated to bins of one grid cell so distinct conditional
+        # beliefs over radii survive the per-cell deduplication.
+        self._radius_bin_size = self.resolution
+        self._num_radius_bins = (
+            int(np.ceil(self.params.object_radius / self._radius_bin_size)) + 2
+        )
+        self._poa_kernels: dict[int, np.ndarray] = {}
+        self._poa_kernel = self._poa_kernel_for_radius(self.r)
 
         num_rl_actions = self.K + int(self.params.include_noop_action)
         self.action_space = spaces.Discrete(num_rl_actions)
@@ -394,6 +396,31 @@ class PolygonCagingEnv(gym.Env):
         self.last_action_angle: float | None = None
         self.viewer_open = False
 
+    def _radius_bins(self, radii: np.ndarray) -> np.ndarray:
+        return np.clip(
+            np.round(np.asarray(radii, dtype=float) / self._radius_bin_size),
+            0,
+            self._num_radius_bins - 1,
+        ).astype(np.int64)
+
+    def _poa_kernel_for_radius(self, radius: float) -> np.ndarray:
+        """Disk dilation kernel for a given radius hypothesis, cached per bin."""
+        rbin = int(np.clip(round(radius / self._radius_bin_size), 0, self._num_radius_bins - 1))
+        kernel = self._poa_kernels.get(rbin)
+        if kernel is None:
+            # Use the bin's upper edge so the dilation stays conservative for
+            # every radius that falls into the bin.
+            bin_radius = (rbin + 0.5) * self._radius_bin_size
+            cells = max(1, int(np.ceil(bin_radius / self.resolution)))
+            offsets = np.arange(-cells, cells + 1)
+            dj, di = np.meshgrid(offsets, offsets, indexing="xy")
+            kernel = (
+                (dj * self.resolution) ** 2 + (di * self.resolution) ** 2
+                <= bin_radius * bin_radius + 1e-12
+            ).astype(np.uint8)
+            self._poa_kernels[rbin] = kernel
+        return kernel
+
     def get_action_angle(self, action: int | None) -> float | None:
         if action is None:
             return None
@@ -424,6 +451,10 @@ class PolygonCagingEnv(gym.Env):
 
         self.t = 0
         self.last_action_angle = None
+
+        # Ice mode melts self.r during the episode; restore it so episodes
+        # are independent.
+        self.r = self.params.object_radius
 
         x0, y0 = self.trajectory[0]
         theta0 = 0.0
@@ -511,9 +542,44 @@ class PolygonCagingEnv(gym.Env):
         mask[center_i[in_bounds], center_j[in_bounds]] = 1
         return mask
 
+    def _poa_mask(self, cage_center: np.ndarray) -> np.ndarray:
+        """
+        POA occupancy: PSS centers dilated by their own radius hypothesis.
+        Particles are grouped by radius bin and each group is dilated with a
+        disk kernel matching that bin, so melted (smaller) hypotheses claim
+        less area than unmelted ones.
+        """
+        poa = np.zeros((self.H, self.W), dtype=np.uint8)
+        if len(self.pss) == 0:
+            return poa
+
+        center_i, center_j = self.world_to_grid_batch(
+            self.pss[:, 0], self.pss[:, 1], tuple(cage_center)
+        )
+        in_bounds = (
+            (0 <= center_i)
+            & (center_i < self.H)
+            & (0 <= center_j)
+            & (center_j < self.W)
+        )
+        center_i = center_i[in_bounds]
+        center_j = center_j[in_bounds]
+        radii = self.pss[in_bounds, 2]
+        if len(center_i) == 0:
+            return poa
+
+        rbins = self._radius_bins(radii)
+        for rbin in np.unique(rbins):
+            group = rbins == rbin
+            occupancy = np.zeros((self.H, self.W), dtype=np.uint8)
+            occupancy[center_i[group], center_j[group]] = 1
+            kernel = self._poa_kernel_for_radius(float(rbin) * self._radius_bin_size)
+            poa |= cv2.dilate(occupancy, kernel, iterations=1)
+        return poa
+
     def _get_belief_observation(self, cage_center: np.ndarray) -> np.ndarray:
         pss_mask = self._pss_mask(cage_center)
-        poa_mask = cv2.dilate(pss_mask, self._poa_kernel, iterations=1)
+        poa_mask = self._poa_mask(cage_center)
         return np.stack((pss_mask, poa_mask), axis=0)
 
     def _get_info(self) -> dict[str, Any]:
@@ -553,6 +619,14 @@ class PolygonCagingEnv(gym.Env):
 
         self.t += 1
         cage_center = np.asarray(self.trajectory[self.t], dtype=float)
+
+        # Ice mode: the real object melts every step (not just on pushes),
+        # using the seeded env RNG so rollouts stay reproducible. The belief
+        # handles melt separately in _propagate_pss as a set-valued branch.
+        if self.params.ice_mode:
+            melt_factor = 1.0 - float(self.np_random.uniform(0.0, self.params.ice_melt_rate))
+            self.r *= melt_factor
+            self.polygon_vertices_body *= melt_factor
 
         # Move/propagate the PSS belief under the chosen action.
         self._propagate_pss(u, cage_center)
@@ -623,11 +697,6 @@ class PolygonCagingEnv(gym.Env):
         return a, b, radial, push_dir
 
     def _push_real_polygon(self, u: float, cage_center: np.ndarray) -> None:
-        if self.params.ice_mode:
-            melt_factor = 1.0 - np.random.uniform(0.0, self.params.ice_melt_rate)
-            self.r *= melt_factor
-            self.polygon_vertices_body *= melt_factor
-
         a, b, radial, push_dir = self._pusher_segment(u, cage_center)
 
         # Bounding-circle contact semantics (paper Sec. 5.1): the object is
@@ -670,8 +739,22 @@ class PolygonCagingEnv(gym.Env):
 
     def _propagate_pss(self, u: float | None, cage_center: np.ndarray) -> None:
         if self.params.ice_mode and len(self.pss) > 0:
-            melt_factors = 1.0 - np.random.uniform(0.0, self.params.ice_melt_rate, size=len(self.pss))
-            self.pss[:, 2] *= melt_factors
+            # Set-valued melt: the true radius shrinks by an unknown factor in
+            # [1 - ice_melt_rate, 1]. Branch every particle on the interval
+            # endpoints; intermediate radii stay covered up to the radius-bin
+            # width used by the per-(cell, radius-bin) deduplication. Sampling
+            # a single factor here would let the belief underestimate the true
+            # radius and silently void the PSS containment guarantee.
+            melted = self.pss.copy()
+            melted[:, 2] *= 1.0 - self.params.ice_melt_rate
+            self.pss = np.vstack((self.pss, melted))
+            # Per-step melt (~1.3% of r) is smaller than the radius bin, so a
+            # melted branch usually lands in its parent's bin. Sort ascending
+            # by radius so the per-(cell, bin) dedup keeps the smallest radius
+            # in each bin and cumulative melt can keep walking downward across
+            # bins instead of being re-rounded up every step. Conservatism is
+            # preserved because POA kernels use each bin's upper edge.
+            self.pss = self.pss[np.argsort(self.pss[:, 2], kind="stable")]
 
         if u is None:
             self.pss = self._deduplicate_and_crop(self.pss, cage_center)
@@ -697,7 +780,9 @@ class PolygonCagingEnv(gym.Env):
         def distance_to_final_pusher(points: np.ndarray) -> np.ndarray:
             return point_segment_distance_batch(points, a_final, b_final)
 
-        occupied_grid = np.zeros(self.H * self.W, dtype=bool)
+        # Deduplicate per (grid cell, radius bin) so particles that share a
+        # position but carry different radius hypotheses both survive.
+        occupied_grid = np.zeros(self.H * self.W * self._num_radius_bins, dtype=bool)
         pss_next_batches: list[np.ndarray] = []
 
         def append_first_unoccupied(points: np.ndarray) -> None:
@@ -721,9 +806,12 @@ class PolygonCagingEnv(gym.Env):
             points_in_bounds = points[in_bounds]
             grid_indices = grid_indices[in_bounds]
 
-            flat_grid_indices = grid_indices[:, 1] * self.W + grid_indices[:, 0]
+            flat_grid_indices = (
+                grid_indices[:, 1] * self.W + grid_indices[:, 0]
+            ) * self._num_radius_bins + self._radius_bins(points_in_bounds[:, 2])
 
-            first_indices = np.full(self.H * self.W, len(flat_grid_indices), dtype=np.int64)
+            num_keys = self.H * self.W * self._num_radius_bins
+            first_indices = np.full(num_keys, len(flat_grid_indices), dtype=np.int64)
             np.minimum.at(
                 first_indices,
                 flat_grid_indices,
@@ -811,6 +899,9 @@ class PolygonCagingEnv(gym.Env):
         if len(points) == 0:
             return np.empty((0, 3), dtype=float)
 
+        # Keep the smallest radius per (cell, radius bin); see _propagate_pss.
+        points = points[np.argsort(points[:, 2], kind="stable")]
+
         grid_indices = np.round(
             (points[:, :2] - cage_center) / self.resolution
             + np.array([self.W / 2, self.H / 2])
@@ -827,10 +918,16 @@ class PolygonCagingEnv(gym.Env):
         grid_indices = grid_indices[in_bounds]
 
         if len(points) == 0:
-            return np.empty((0, 2), dtype=float)
+            return np.empty((0, 3), dtype=float)
 
-        flat_grid_indices = grid_indices[:, 1] * self.W + grid_indices[:, 0]
-        first_indices = np.full(self.H * self.W, len(flat_grid_indices), dtype=np.int64)
+        flat_grid_indices = (
+            grid_indices[:, 1] * self.W + grid_indices[:, 0]
+        ) * self._num_radius_bins + self._radius_bins(points[:, 2])
+        first_indices = np.full(
+            self.H * self.W * self._num_radius_bins,
+            len(flat_grid_indices),
+            dtype=np.int64,
+        )
 
         np.minimum.at(
             first_indices,
@@ -863,14 +960,25 @@ class PolygonCagingEnv(gym.Env):
         )
         center_i = center_i[in_bounds]
         center_j = center_j[in_bounds]
+        radii = (
+            pss[in_bounds, 2]
+            if pss.shape[1] >= 3
+            else np.full(len(center_i), self.r, dtype=float)
+        )
 
         if len(center_i) == 0:
             return np.empty((0, 2), dtype=np.float64)
 
-        occupancy = np.zeros((self.H, self.W), dtype=np.uint8)
-        occupancy[center_i, center_j] = 1
-
-        dilated = cv2.dilate(occupancy, self._poa_kernel, iterations=1)
+        # Dilate per radius bin so each radius hypothesis claims only the
+        # area its own bounding circle can occupy.
+        rbins = self._radius_bins(radii)
+        dilated = np.zeros((self.H, self.W), dtype=np.uint8)
+        for rbin in np.unique(rbins):
+            group = rbins == rbin
+            occupancy = np.zeros((self.H, self.W), dtype=np.uint8)
+            occupancy[center_i[group], center_j[group]] = 1
+            kernel = self._poa_kernel_for_radius(float(rbin) * self._radius_bin_size)
+            dilated |= cv2.dilate(occupancy, kernel, iterations=1)
         occupied_i, occupied_j = np.nonzero(dilated)
 
         cx, cy = cage_center
@@ -900,7 +1008,7 @@ class PolygonCagingEnv(gym.Env):
         next_cage_center = np.asarray(self.trajectory[self.t + 1], dtype=float)
         cage_center_arr = next_cage_center
 
-        rel_pss_to_cage = self.pss - cage_center_arr
+        rel_pss_to_cage = self.pss[:, :2] - cage_center_arr
         pss_radius_sq = np.sum(rel_pss_to_cage * rel_pss_to_cage, axis=1)
 
         if np.all(pss_radius_sq <= self.cage_radius * self.cage_radius):
@@ -985,6 +1093,11 @@ class PolygonCagingEnv(gym.Env):
         )
         point_i = point_i[in_bounds]
         point_j = point_j[in_bounds]
+        radii = (
+            np.asarray(points)[in_bounds, 2]
+            if np.asarray(points).ndim == 2 and np.asarray(points).shape[1] >= 3
+            else np.full(len(point_i), self.r, dtype=float)
+        )
 
         if len(point_i) == 0:
             return
@@ -992,7 +1105,17 @@ class PolygonCagingEnv(gym.Env):
         pss_mask = np.zeros((image_h, image_w), dtype=np.uint8)
         pss_mask[point_i, point_j] = 1
 
-        poa_mask = cv2.dilate(pss_mask, self._poa_kernel, iterations=1).astype(bool)
+        # Dilate per radius bin so melted hypotheses are drawn with their own
+        # (smaller) footprint.
+        rbins = self._radius_bins(radii)
+        poa_mask = np.zeros((image_h, image_w), dtype=np.uint8)
+        for rbin in np.unique(rbins):
+            group = rbins == rbin
+            occupancy = np.zeros((image_h, image_w), dtype=np.uint8)
+            occupancy[point_i[group], point_j[group]] = 1
+            kernel = self._poa_kernel_for_radius(float(rbin) * self._radius_bin_size)
+            poa_mask |= cv2.dilate(occupancy, kernel, iterations=1)
+        poa_mask = poa_mask.astype(bool)
         pss_mask = pss_mask.astype(bool)
 
         image[poa_mask] = poa_color
