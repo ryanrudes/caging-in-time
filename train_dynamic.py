@@ -17,7 +17,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
 from torch.utils.tensorboard import SummaryWriter
 
-from dynamic import DynamicPlateTilt, DynamicPlateTiltConfig
+from dynamic_env import DynamicPlateTilt, DynamicPlateTiltConfig
 
 
 RUNS_DIR = Path("runs")

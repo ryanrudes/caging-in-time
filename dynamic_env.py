@@ -74,6 +74,9 @@ class DynamicPlateTiltConfig:
     # Rendering.
     render_pss: bool = False
 
+    ice_mode: bool = False
+    ice_melt_rate: float = 0.001
+
 
 class DynamicPlateTilt(gym.Env):
     metadata = {"render_modes": ["rgb_array"], "render_fps": 50}
@@ -141,7 +144,7 @@ class DynamicPlateTilt(gym.Env):
         self.plate_acceleration = np.zeros(self.n, dtype=float)
         self.g_theta = np.zeros(self.n, dtype=float)
         self.a_p = np.zeros(self.n, dtype=float)
-        self.pss = np.zeros((self.config.pss_sample_count, 2 * self.n), dtype=float)
+        self.pss = np.zeros((self.config.pss_sample_count, 2 * self.n + 1), dtype=float)
         self.pss_weights = np.full(self.config.pss_sample_count, 1.0 / self.config.pss_sample_count)
         self._render_bounds = self._compute_render_bounds()
 
@@ -343,6 +346,9 @@ class DynamicPlateTilt(gym.Env):
         self.t += 1
         self._update_plate_trajectory_terms()
         self._update_frame_terms()
+
+        if self.config.ice_mode:
+            self.r_b *= (1.0 - float(self.np_random.uniform(0.0, self.config.ice_melt_rate)))
 
         acceleration = self.ball_acceleration(self.xdot, self.g_theta, self.a_p)
         self.x = self.x + self.config.dt * self.xdot
@@ -612,7 +618,7 @@ class DynamicPlateTilt(gym.Env):
         state, a known future trajectory preview, and the PSS/belief.
         """
         positions = self.pss[:, : self.n]
-        velocities = self.pss[:, self.n :]
+        velocities = self.pss[:, self.n : 2 * self.n]
 
         pss_mean_position = np.mean(positions, axis=0)
         pss_std_position = np.std(positions, axis=0)
@@ -753,12 +759,18 @@ class DynamicPlateTilt(gym.Env):
             self.config.pss_velocity_std,
             size=(self.config.pss_sample_count, self.n),
         )
-        self.pss = np.column_stack((self.x + position_noise, self.xdot + velocity_noise))
+        self.pss = np.column_stack((self.x + position_noise, self.xdot + velocity_noise, np.full(self.config.pss_sample_count, self.r_b)))
         self.pss_weights = np.full(self.config.pss_sample_count, 1.0 / self.config.pss_sample_count)
 
     def _propagate_pss(self) -> None:
         positions = self.pss[:, : self.n]
-        velocities = self.pss[:, self.n :]
+        velocities = self.pss[:, self.n : 2 * self.n]
+        radii = self.pss[:, 2 * self.n]
+        
+        if self.config.ice_mode:
+            melt_factors = 1.0 - self.np_random.uniform(0.0, self.config.ice_melt_rate, size=len(radii))
+            radii = radii * melt_factors
+
         acceleration_noise = self.np_random.normal(
             0.0,
             self.config.pss_acceleration_std,
@@ -770,7 +782,7 @@ class DynamicPlateTilt(gym.Env):
         accelerations = accelerations + acceleration_noise
         positions = positions + self.config.dt * velocities
         velocities = velocities + self.config.dt * accelerations
-        self.pss = np.column_stack((positions, velocities))
+        self.pss = np.column_stack((positions, velocities, radii))
 
         # The paper normalizes the discretized probability distribution after
         # propagation. Here the particle approximation keeps uniform weights.
@@ -780,7 +792,7 @@ class DynamicPlateTilt(gym.Env):
         energies = [
             self.total_energy(
                 x=state[: self.n],
-                xdot=state[self.n :],
+                xdot=state[self.n : 2 * self.n],
                 g_theta=self.g_theta,
                 a_p=self.a_p,
             )
@@ -793,7 +805,7 @@ class DynamicPlateTilt(gym.Env):
             [
                 self.total_energy(
                     x=state[: self.n],
-                    xdot=state[self.n :],
+                    xdot=state[self.n : 2 * self.n],
                     g_theta=self.g_theta,
                     a_p=self.a_p,
                 )
@@ -808,7 +820,7 @@ class DynamicPlateTilt(gym.Env):
             [
                 self.total_energy(
                     x=state[: self.n],
-                    xdot=state[self.n :],
+                    xdot=state[self.n : 2 * self.n],
                     g_theta=self.g_theta,
                     a_p=self.a_p,
                 )
@@ -828,8 +840,10 @@ class DynamicPlateTilt(gym.Env):
         self.g_theta = self.config.gravity * np.sin(self.theta)
 
         # Non-inertial pseudo-acceleration in the plate frame induced by the
-        # prescribed translational acceleration of the plate.
-        self.a_p = -self.plate_acceleration.copy()
+        # prescribed translational acceleration of the plate. Only the
+        # component tangential to the tilted plate acts on the rolling ball
+        # (cos(theta) projection, cf. Eq. 38 in the paper).
+        self.a_p = -self.plate_acceleration * np.cos(self.theta)
 
     def _update_plate_trajectory_terms(self) -> None:
         time = self.t * self.config.dt

@@ -20,6 +20,25 @@ def create_circular_trajectory(radius: float, speed: float) -> list[tuple[float,
     return waypoints
 
 
+def create_figure8_trajectory(radius: float, speed: float) -> list[tuple[float, float]]:
+    """
+    Lemniscate-of-Gerono infinity trajectory, resampled to (approximately)
+    uniform arc-length spacing so consecutive waypoints are `speed` apart.
+    """
+    dense_t = np.linspace(0.0, tau, 20_000, endpoint=False)
+    dense = np.column_stack(
+        (radius * np.sin(dense_t), radius * np.sin(dense_t) * np.cos(dense_t))
+    )
+    deltas = np.diff(dense, axis=0, append=dense[:1])
+    arc = np.concatenate(([0.0], np.cumsum(np.linalg.norm(deltas, axis=1))[:-1]))
+    total_length = arc[-1] + float(np.linalg.norm(dense[0] - dense[-1]))
+
+    num_waypoints = max(2, int(total_length / speed))
+    targets = np.linspace(0.0, total_length, num_waypoints, endpoint=False)
+    indices = np.searchsorted(arc, targets, side="left").clip(0, len(dense) - 1)
+    return [tuple(point) for point in dense[indices]]
+
+
 def transform_polygon(vertices_body: np.ndarray, pose: np.ndarray) -> np.ndarray:
     x, y, theta = pose
     c = np.cos(theta)
@@ -223,21 +242,35 @@ class CagingEnvParams:
     pusher_length: float = 0.10
     push_distance: float = 0.02
     cage_size: float = 0.020
+    # The belief grid must cover at least the cage circle S_A (radius
+    # R = cage_size + object_radius = 45 mm) so PSS points are not silently
+    # cropped away. 121 cells at 1 mm covers +/- 60 mm around the cage center.
     resolution: float = 0.001
-    grid_height: int = 251
-    grid_width: int = 251
-    num_actions: int = 128
+    grid_height: int = 121
+    grid_width: int = 121
+    # K candidate pusher angles. The paper evaluates K in {16, 32, 64, 128};
+    # below 16 the angular spacing is too coarse for reliable caging.
+    num_actions: int = 32
     num_polygon_vertices: int = 7
+
+    ice_mode: bool = False
+    ice_melt_rate: float = 0.001
 
     lambda_1: float = 1.0
     lambda_2: float = 1.0
 
+    trajectory_shape: str = "circle"  # "circle" or "figure8"
     trajectory_radius: float = 0.05
     trajectory_speed: float = 0.001
+    trajectory_loops: int = 1
 
     max_episode_steps: int | None = None
     include_noop_action: bool = True
-    include_polygon_state_in_obs: bool = True
+
+    # When True, the true object pose and polygon vertices are appended to the
+    # observation. This is privileged information unavailable in a real
+    # deployment of Caging in Time; keep False for limited-information agents.
+    include_polygon_state_in_obs: bool = False
 
     # Real-object dynamics knobs.
     contact_margin: float = 0.006
@@ -294,10 +327,19 @@ class PolygonCagingEnv(gym.Env):
         self.lambda_1 = self.params.lambda_1
         self.lambda_2 = self.params.lambda_2
 
-        self.trajectory = create_circular_trajectory(
-            radius=self.params.trajectory_radius,
-            speed=self.params.trajectory_speed,
-        )
+        if self.params.trajectory_shape == "figure8":
+            single_loop = create_figure8_trajectory(
+                radius=self.params.trajectory_radius,
+                speed=self.params.trajectory_speed,
+            )
+        elif self.params.trajectory_shape == "circle":
+            single_loop = create_circular_trajectory(
+                radius=self.params.trajectory_radius,
+                speed=self.params.trajectory_speed,
+            )
+        else:
+            raise ValueError(f"Unknown trajectory_shape {self.params.trajectory_shape!r}")
+        self.trajectory = single_loop * max(1, self.params.trajectory_loops)
 
         self.max_episode_steps = (
             self.params.max_episode_steps
@@ -348,7 +390,7 @@ class PolygonCagingEnv(gym.Env):
 
         self.t = 0
         self.object_pose = np.zeros(3, dtype=float)
-        self.pss = np.empty((0, 2), dtype=float)
+        self.pss = np.empty((0, 3), dtype=float)
         self.last_action_angle: float | None = None
         self.viewer_open = False
 
@@ -403,7 +445,7 @@ class PolygonCagingEnv(gym.Env):
         self.object_pose = np.array([x0, y0, theta0], dtype=float)
 
         # Internal belief starts with the true object center.
-        self.pss = np.array([[x0, y0]], dtype=float)
+        self.pss = np.array([[x0, y0, self.r]], dtype=float)
 
         obs = self._get_obs()
         info = self._get_info()
@@ -485,7 +527,11 @@ class PolygonCagingEnv(gym.Env):
             "cage_center": tuple(cage_center),
             "object_pose": self.object_pose.copy(),
             "polygon_world": polygon_world,
-            "contained": bool(max_vertex_dist <= self.R),
+            # Two grid cells of tolerance, matching the Alg. 2 verification in
+            # main.py: the PSS propagation and the worst-case push displacement
+            # are quantized to the grid, so the true state can legitimately sit
+            # up to ~2 cells outside R-r while caging is still working.
+            "contained": bool(max_vertex_dist <= self.R + 2.0 * self.resolution),
             "max_vertex_dist": max_vertex_dist,
             "pss_size": int(len(self.pss)),
             "heuristic_action": None,
@@ -503,6 +549,7 @@ class PolygonCagingEnv(gym.Env):
             return obs, 0.0, False, True, info
 
         prev_cage_center = np.asarray(self.trajectory[self.t], dtype=float)
+        previous_action_angle = self.last_action_angle
 
         self.t += 1
         cage_center = np.asarray(self.trajectory[self.t], dtype=float)
@@ -513,8 +560,9 @@ class PolygonCagingEnv(gym.Env):
         # Simulate the real polygonal object under the chosen action.
         if u is not None:
             self._push_real_polygon(u, cage_center)
-
-        self.last_action_angle = u
+            # The paper's tie-breaking (Alg. 4) uses the angle of the last
+            # executed push, so the stored angle survives no-op steps.
+            self.last_action_angle = u
 
         obs = self._get_obs()
         info = self._get_info()
@@ -526,6 +574,7 @@ class PolygonCagingEnv(gym.Env):
         reward = self._compute_reward(
             contained=contained,
             action_angle=u,
+            previous_action_angle=previous_action_angle,
             cage_center=cage_center,
             prev_cage_center=prev_cage_center,
         )
@@ -539,9 +588,12 @@ class PolygonCagingEnv(gym.Env):
         self,
         contained: bool,
         action_angle: float | None,
+        previous_action_angle: float | None,
         cage_center: np.ndarray,
         prev_cage_center: np.ndarray,
     ) -> float:
+        # Training-time reward may use the true (privileged) object state; the
+        # agent's observation remains limited to belief + trajectory.
         polygon_world = transform_polygon(self.polygon_vertices_body, self.object_pose)
         max_vertex_dist = np.max(np.linalg.norm(polygon_world - cage_center, axis=1))
 
@@ -551,8 +603,8 @@ class PolygonCagingEnv(gym.Env):
 
         if action_angle is not None:
             reward -= self.params.action_penalty
-            if self.last_action_angle is not None:
-                angular_change = abs((action_angle - self.last_action_angle + pi) % tau - pi)
+            if previous_action_angle is not None:
+                angular_change = abs((action_angle - previous_action_angle + pi) % tau - pi)
                 reward -= 0.01 * angular_change
 
         if not contained:
@@ -571,9 +623,32 @@ class PolygonCagingEnv(gym.Env):
         return a, b, radial, push_dir
 
     def _push_real_polygon(self, u: float, cage_center: np.ndarray) -> None:
-        polygon_world = transform_polygon(self.polygon_vertices_body, self.object_pose)
+        if self.params.ice_mode:
+            melt_factor = 1.0 - np.random.uniform(0.0, self.params.ice_melt_rate)
+            self.r *= melt_factor
+            self.polygon_vertices_body *= melt_factor
+
         a, b, radial, push_dir = self._pusher_segment(u, cage_center)
 
+        # Bounding-circle contact semantics (paper Sec. 5.1): the object is
+        # "in collision" when the pusher intersects its bounding circle, and
+        # the push displaces it so the circle resolves penetration with the
+        # pusher's final pose. This is the worst-case displacement on the
+        # boundary of the Peshkin motion set (Eq. 9), so the true state stays
+        # covered by the propagated PSS. Modeling polygon-only contact would
+        # let the pusher "miss" the real object while the belief assumes the
+        # circle was pushed, silently breaking the caging guarantee.
+        center = self.object_pose[:2]
+        center_dist = point_segment_distance_batch(center[np.newaxis, :], a, b)[0]
+        d_con = float(np.clip(self.r + self.d_push - center_dist, 0.0, self.d_push))
+        if d_con <= 0.0:
+            return
+
+        self.object_pose[:2] = center + d_con * push_dir
+
+        # Shape-dependent rotation: off-center swept contact with the actual
+        # polygon induces rotation (crude torque model).
+        polygon_world = transform_polygon(self.polygon_vertices_body, self.object_pose)
         push_amount, contact_point = polygon_swept_push_contact(
             polygon_world=polygon_world,
             segment_a=a,
@@ -582,14 +657,9 @@ class PolygonCagingEnv(gym.Env):
             push_distance=self.d_push,
             contact_margin=self.params.contact_margin,
         )
-
         if push_amount <= 0.0 or contact_point is None:
             return
 
-        # Translate actual polygon by the remaining pusher stroke after first contact.
-        self.object_pose[:2] += push_amount * push_dir
-
-        # Crude torque model: off-center swept contact induces rotation.
         lever = contact_point - self.object_pose[:2]
         torque_z = lever[0] * push_dir[1] - lever[1] * push_dir[0]
         self.object_pose[2] += self.params.rotation_gain * torque_z * push_amount / max(
@@ -599,16 +669,33 @@ class PolygonCagingEnv(gym.Env):
         self.object_pose[2] = (self.object_pose[2] + pi) % tau - pi
 
     def _propagate_pss(self, u: float | None, cage_center: np.ndarray) -> None:
+        if self.params.ice_mode and len(self.pss) > 0:
+            melt_factors = 1.0 - np.random.uniform(0.0, self.params.ice_melt_rate, size=len(self.pss))
+            self.pss[:, 2] *= melt_factors
+
         if u is None:
             self.pss = self._deduplicate_and_crop(self.pss, cage_center)
             return
 
         a, b, radial, push_dir = self._pusher_segment(u, cage_center)
-        distances = point_segment_distance_batch(self.pss, a, b)
+        distances = point_segment_distance_batch(self.pss[:, :2], a, b)
 
-        d_cons = np.clip(self.r + self.d_push - distances, 0.0, self.d_push)
+        radii = self.pss[:, 2] if self.pss.shape[1] >= 3 else self.r
+        d_cons = np.clip(radii + self.d_push - distances, 0.0, self.d_push)
         contacted = d_cons > 0.0
         uncontacted = ~contacted
+
+        # Final pose of the pusher segment after sweeping d_push toward the
+        # cage center. Propagated belief states whose bounding circle would
+        # intersect this segment are not in the object's free space (Eq. 1)
+        # and must be excluded, otherwise the PSS can only grow and pushes
+        # never contract the belief.
+        push_displacement = self.d_push * push_dir
+        a_final = a + push_displacement
+        b_final = b + push_displacement
+
+        def distance_to_final_pusher(points: np.ndarray) -> np.ndarray:
+            return point_segment_distance_batch(points, a_final, b_final)
 
         occupied_grid = np.zeros(self.H * self.W, dtype=bool)
         pss_next_batches: list[np.ndarray] = []
@@ -618,7 +705,7 @@ class PolygonCagingEnv(gym.Env):
                 return
 
             grid_indices = np.round(
-                (points - cage_center) / self.resolution
+                (points[:, :2] - cage_center) / self.resolution
                 + np.array([self.W / 2, self.H / 2])
             ).astype(int)
 
@@ -696,22 +783,36 @@ class PolygonCagingEnv(gym.Env):
 
                 for start_idx in range(0, len(batch_points), chunk_size):
                     chunk_points = batch_points[start_idx : start_idx + chunk_size]
-                    moved_points = (
-                        chunk_points[:, np.newaxis, :] + offsets[np.newaxis, :, :]
+                    moved_xy = (
+                        chunk_points[:, np.newaxis, :2] + offsets[np.newaxis, :, :]
                     ).reshape(-1, 2)
-                    append_first_unoccupied(moved_points)
+                    radii_repeated = np.repeat(chunk_points[:, 2], len(offsets))
+                    moved_points = np.column_stack((moved_xy, radii_repeated))
+
+                    # Keep only motions that resolve contact with the pusher's
+                    # final pose, best effort per state when d_con cannot fully
+                    # clear the overlap, with one grid cell of slack for the
+                    # discretized motion offsets.
+                    dist_final = distance_to_final_pusher(moved_points[:, :2]).reshape(
+                        len(chunk_points), len(offsets)
+                    )
+                    per_state_target = np.minimum(chunk_points[:, 2], dist_final.max(axis=1))
+                    keep = dist_final >= (
+                        per_state_target[:, np.newaxis] - self.resolution - 1e-9
+                    )
+                    append_first_unoccupied(moved_points[keep.reshape(-1)])
 
         if pss_next_batches:
             self.pss = np.vstack(pss_next_batches)
         else:
-            self.pss = np.empty((0, 2), dtype=float)
+            self.pss = np.empty((0, 3), dtype=float)
 
     def _deduplicate_and_crop(self, points: np.ndarray, cage_center: np.ndarray) -> np.ndarray:
         if len(points) == 0:
-            return np.empty((0, 2), dtype=float)
+            return np.empty((0, 3), dtype=float)
 
         grid_indices = np.round(
-            (points - cage_center) / self.resolution
+            (points[:, :2] - cage_center) / self.resolution
             + np.array([self.W / 2, self.H / 2])
         ).astype(int)
 
@@ -816,20 +917,22 @@ class PolygonCagingEnv(gym.Env):
         if poa_points.shape[0] > 0:
             rel_poa = poa_points[np.newaxis, :, :] - pusher_centers[:, np.newaxis, :]
             poa_outward_depth = np.einsum("knd,kd->kn", rel_poa, radials)
-            on_pusher_side = poa_outward_depth >= -self.r
+            on_pusher_side = poa_outward_depth >= 0.0
             within_pusher_span = np.abs(
                 np.einsum("knd,kd->kn", rel_poa, tangents)
             ) <= 0.5 * self.L
             poa_behind_pusher = on_pusher_side & within_pusher_span
 
+            # S_out^k: POA area behind the line pusher (paper Fig. 7, right).
             poa_area_behind = (
                 np.count_nonzero(poa_behind_pusher, axis=1).astype(float) * cell_area
             )
 
-            poa_depth_behind_pusher = poa_outward_depth + self.r
+            # d_out^k: furthest distance from behind the pusher to the POA
+            # boundary.
             poa_depth_behind_pusher = np.where(
                 poa_behind_pusher,
-                poa_depth_behind_pusher,
+                poa_outward_depth,
                 0.0,
             )
             furthest_dist = np.max(poa_depth_behind_pusher, axis=1)
